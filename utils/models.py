@@ -127,3 +127,25 @@ class GCN_explainer(torch.nn.Module):
         x = F.relu(self.conv1(x, edge_index, edge_weight=edge_weight))
         x = self.conv2(x, edge_index, edge_weight=edge_weight)
         return x
+
+    def back(self, x, edge_index, edge_weight):
+        """用于 convex 方法的反向传播，返回中间层激活值"""
+        x_0 = self.conv1(x, edge_index, edge_weight=edge_weight)
+        x_1 = F.relu(x_0)
+        return (x_0, x_1)
+
+
+from torch_geometric.nn import GCNConv as GCNConvPyG
+
+class GCN_explainer_pyg(torch.nn.Module):
+    """用于 PyG 内置解释器（GNNExplainer, PGExplainer）"""
+    def __init__(self, nfeat, nhid, nclass, dropout):
+        super().__init__()
+        self.conv1 = GCNConvPyG(nfeat, nhid, normalize=False, add_self_loops=False, bias=False)
+        self.conv2 = GCNConvPyG(nhid, nclass, normalize=False, add_self_loops=False, bias=False)
+        self.dropout = dropout
+
+    def forward(self, x, edge_index, edge_weight=None):
+        x = F.relu(self.conv1(x, edge_index, edge_weight=edge_weight))
+        x = self.conv2(x, edge_index, edge_weight=edge_weight)
+        return x

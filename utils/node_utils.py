@@ -479,3 +479,48 @@ def maybe_num_nodes(edge_index, num_nodes=None):
 
 def normalize_ricci(kappa):
     return (kappa + 2) / 3
+
+def from_edges_to_evaulate(select_edges_list,edges_weight_old,edges_old,edges_old_dict,adj_old,adj_new):
+    evaluate_edge_weight = copy.deepcopy(edges_weight_old.tolist())
+    evaluate_edge_index= copy.deepcopy(edges_old)
+
+    for edge in select_edges_list:
+        if edge[0] != edge[1]:
+            if adj_old[edge[0], edge[1]] != 0:
+                value1 = edges_old_dict[str(edge[0]) + ',' + str(edge[1])]
+                evaluate_edge_weight[value1] = adj_new[edge[0], edge[1]]
+
+                value2 = edges_old_dict[str(edge[1]) + ',' + str(edge[0])]
+                evaluate_edge_weight[value2] = adj_new[edge[1], edge[0]]
+            else:
+                evaluate_edge_index[0].append(edge[0])
+                evaluate_edge_index[1].append(edge[1])
+                evaluate_edge_weight.append(adj_new[edge[0], edge[1]])
+
+                evaluate_edge_index[0].append(edge[1])
+                evaluate_edge_index[1].append(edge[0])
+                evaluate_edge_weight.append(adj_new[edge[1], edge[0]])
+
+
+        else:
+            if adj_old[edge[0], edge[1]] != 0:
+                value1 = edges_old_dict[str(edge[0]) + ',' + str(edge[1])]
+                evaluate_edge_weight[value1] = adj_new[edge[0], edge[1]]
+            else:
+                evaluate_edge_index[0].append(edge[0])
+                evaluate_edge_index[1].append(edge[1])
+                evaluate_edge_weight.append(adj_new[edge[0], edge[1]])
+
+    return evaluate_edge_index,evaluate_edge_weight
+
+
+def smooth(arr, eps=1e-5):
+    if 0 in arr:
+        return abs(arr - eps)
+    else:
+        return arr
+
+def KL_divergence(P, Q):
+    P = smooth(P)
+    Q = smooth(Q)
+    return sum(P * np.log(P / Q))
