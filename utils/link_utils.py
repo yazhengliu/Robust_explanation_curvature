@@ -12,6 +12,8 @@ import argparse
 from torch_geometric.nn import GCNConv
 import torch.nn as nn
 from torch import Tensor
+import cvxpy as cvx
+import copy
 class SynGraphDataset(InMemoryDataset):
     def __init__(self, root, name, transform=None, pre_transform=None):
         self.name = name
@@ -929,3 +931,247 @@ def edge_percentage(x, tol=0.001):
     max_count = max(counts)
     percentage = max_count / x.numel()
     return percentage
+
+def test_path_contribution_edge(paths,adj_start,adj_end,addedgelist,relu_delta,relu_start,relu_end,x_tensor,W1,W2):
+    XW1=torch.mm(x_tensor,W1)
+    path_result_dict=dict()
+    node_result_dict=dict()
+    edge_result_dict_zong=dict()
+    for edge in addedgelist:
+        edge_key=str(edge[0])+','+str(edge[1])
+        edge_result_dict_zong[edge_key]=np.zeros((adj_end.shape[0],W2.shape[1]))
+
+
+    for path in paths:
+        if ([path[0],path[1]] in addedgelist or  [path[1],path[0]] in addedgelist) and ([path[2],path[1]] in addedgelist or  [path[1],path[2]] in addedgelist):
+            # print(adj_end[path[1],path[2]])
+
+
+            if adj_end[path[1],path[2]]>=adj_start[path[1],path[2]]:
+                f1=adj_start[path[1],path[2]]*torch.mm(torch.unsqueeze((adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*relu_delta[path[1]]*XW1[path[0]],0),W2)
+                f2=(adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) *torch.mm(torch.unsqueeze((adj_end[path[1],path[0]])*relu_end[path[1]]*XW1[path[0]],0),W2)
+                f3=f1+f2
+
+                f4=f1
+                f5=(adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) *torch.mm(torch.unsqueeze((adj_start[path[1],path[0]])*relu_start[path[1]]*XW1[path[0]],0),W2)
+
+            else:
+                # print('torch.mul',torch.mul(relu_delta[path[1]],XW1[path[0]]))
+                # weight=(adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*torch.mul(relu_delta[path[1]],XW1[path[0]])
+                # print(weight.shape)
+                # print(W2.shape)
+                # print('f1',torch.mm(torch.unsqueeze(weight,0),W2))
+                f1=adj_end[path[1],path[2]]*torch.mm(torch.unsqueeze((adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*torch.mul(relu_delta[path[1]],XW1[path[0]]),0),W2)
+                f2=(adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) * torch.mm(torch.unsqueeze((adj_start[path[1],path[0]]) * relu_start[path[1]] * XW1[path[0]],0)
+                    , W2)
+                f3=f1+f2
+
+                f4=adj_start[path[1],path[2]]*torch.mm(torch.unsqueeze((adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*relu_delta[path[1]]*XW1[path[0]],0),W2)
+                f5=(adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) *torch.mm(torch.unsqueeze((adj_start[path[1],path[0]])*relu_start[path[1]]*XW1[path[0]],0),W2)
+
+                # f1 = adj_start[path[1]][path[2]] * np.dot(
+                #     (adj_end[path[1]][path[0]] - adj_start[path[1]][path[0]]) * relu_delta[path[1]] * XW1[path[0]], W2)
+                # f2 = (adj_end[path[1]][path[2]] - adj_start[path[1]][path[2]]) * np.dot(
+                #     (adj_end[path[1]][path[0]]) * relu_end[path[1]] * XW1[path[0]], W2)
+                # f3 = f1 + f2
+                #
+                # f4 = f1
+                # f5 = (adj_end[path[1]][path[2]] - adj_start[path[1]][path[2]]) * np.dot(
+                #     (adj_start[path[1]][path[0]]) * relu_start[path[1]] * XW1[path[0]], W2)
+
+            # print('f1',f1)
+            # print('f2', f2)
+            # print('f3',f3)
+            f3=torch.squeeze(f3,0)
+            f4 = torch.squeeze(f4, 0)
+            f5 = torch.squeeze(f5, 0)
+            f3=f3.detach().numpy()
+            f4=f4.detach().numpy()
+            f5=f5.detach().numpy()
+
+            contribution_edge_1 = 0.5 * (f3 - f5 + f4)
+            contribution_edge_2 = 0.5 * (f3 - f4 + f5)
+
+            # print('contribution_edge_1',contribution_edge_1)
+            # print('contribution_edge_1.shape', contribution_edge_1.shape)
+
+            p_key = str(path[0]) + ',' + str(path[1]) + ',' + str(path[2])
+            path_result_dict[p_key] = f3
+            if path[2] not in node_result_dict.keys():
+                node_result_dict[path[2]] = f3
+            else:
+                node_result_dict[path[2]] += f3
+
+
+            if [path[0],path[1]] in addedgelist:
+                edge_1=str(path[0])+','+str(path[1])
+            else:
+                edge_1 = str(path[1]) + ',' + str(path[0])
+
+            if edge_1 in edge_result_dict_zong.keys():
+                edge_result_dict_zong[edge_1][path[2]]+=contribution_edge_1
+            else:
+                edge_result_dict_zong[edge_1][path[2]]= contribution_edge_1
+
+            if [path[2], path[1]] in addedgelist:
+                edge_2 = str(path[2]) + ',' + str(path[1])
+            else:
+                edge_2 = str(path[1]) + ',' + str(path[2])
+
+            if edge_2 in edge_result_dict_zong.keys():
+                edge_result_dict_zong[edge_2][path[2]] += contribution_edge_2
+            else:
+                edge_result_dict_zong[edge_2][path[2]] = contribution_edge_2
+
+
+
+        else:
+            for i in range(len(path) - 1):
+                # edge_key = str(path[i]) + ',' + str(path[i + 1]) +','+ str(i)
+                if [path[i], path[i + 1]] in addedgelist:
+                    edge_key = str(path[i]) + ',' + str(path[i + 1])
+                elif [path[i + 1], path[i]] in addedgelist:
+                    edge_key = str(path[i + 1]) + ',' + str(path[i])
+
+            if adj_end[path[1],path[2]]>=adj_start[path[1],path[2]]:
+                contribution=adj_start[path[1],path[2]]*torch.mm(torch.unsqueeze((adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*relu_delta[path[1]]*XW1[path[0]],0),W2)+ \
+                             (adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) *torch.mm(torch.unsqueeze((adj_end[path[1],path[0]])*relu_end[path[1]]*XW1[path[0]],0),W2)
+
+            else:
+                contribution=adj_end[path[1],path[2]]*torch.mm(torch.unsqueeze((adj_end[path[1],path[0]]-adj_start[path[1],path[0]])*relu_delta[path[1]]*XW1[path[0]],0),W2)+ \
+                             (adj_end[path[1],path[2]] - adj_start[path[1],path[2]]) * torch.mm(
+                    torch.unsqueeze((adj_start[path[1],path[0]]) * relu_start[path[1]] * XW1[path[0]],0), W2)
+
+
+
+
+
+
+            # if edge_key in edge_result_dict_zong.keys():
+            #     edge_result_dict_zong[edge_key][path[2]]+=contribution
+            # else:
+            #     edge_result_dict_zong[edge_key][path[2]]= contribution
+            contribution=torch.squeeze(contribution,0)
+            contribution=contribution.detach().numpy()
+
+            if edge_key in edge_result_dict_zong.keys():
+                edge_result_dict_zong[edge_key][path[2]]+=contribution
+            else:
+                edge_result_dict_zong[edge_key][path[2]]= contribution
+
+            p_key = str(path[0]) + ',' + str(path[1]) + ',' + str(path[2])
+            path_result_dict[p_key] = contribution
+            if path[2] not in node_result_dict.keys():
+                node_result_dict[path[2]] = contribution
+            else:
+                node_result_dict[path[2]] += contribution
+
+    return path_result_dict,node_result_dict,edge_result_dict_zong
+
+def map_target(result_dict,target_node):
+    final_dict=dict()
+    for key,value in result_dict.items():
+        final_dict[key]=value[target_node]
+    return final_dict
+
+def mlp_contribution(result_dict,W):
+    for key,value in result_dict.items():
+        result_dict[key]=value.dot(W)
+    return result_dict
+
+def main_con_edge(select_number_path,edge_result_dict, edgelist,old_tensor,new_tensor): #convex
+
+    edge_selected= cvx.Variable(len(edgelist),boolean=False)
+
+    tmp_logits = copy.deepcopy(old_tensor)
+
+    # print('edge_result_dict',edge_result_dict)
+    # print('edgelist',edgelist)
+
+    for i in range(len(edgelist)):
+        add_matrix = np.array(
+            edge_result_dict[str(edgelist[i][0]) + ',' + str(edgelist[i][1])])
+        tmp_logits = tmp_logits + edge_selected[i] * add_matrix
+
+    # print(old_tensor.shape)
+    # print('tmp_logits ',tmp_logits)
+
+    new_prob=softmax(new_tensor)
+    d=0
+    for i in range(0,2):
+        d=d+tmp_logits[i]*new_prob[i]
+    # e=0
+    # for i in range(0,ma.shape[1]):
+    #     # e=e+cvx.atoms.exp(c[i])
+    #     e = e + cvx.atoms.exp(y[i])
+    # print('e',e)
+    # print('e.shape',e.shape)
+    #
+    #
+    #
+    #
+    # # f=sum(c*softmax(Hnew[layernumbers*2-1][goal]))
+    # # print(c*softmax(Hnew[layernumbers*2-1][goal]).shape)
+    # # print(cvx.atoms.log_sum_exp(c).shape)
+    objective = cvx.Minimize(-d+cvx.atoms.log_sum_exp(tmp_logits))
+    constraints = [sum(edge_selected)== select_number_path]
+
+    for i in range(0,len(edgelist)):
+        constraints.append(0 <= edge_selected[i])
+        constraints.append(edge_selected[i] <= 1)
+
+    # for i in range(0,len(edgelist)):
+    #     constraints.append(0 <= edge_selected[i])
+    #     constraints.append(edge_selected[i] <= 1)
+    # print(constraints)
+    prob = cvx.Problem(objective, constraints)
+    solver_options = {'max_iters': 1000, 'eps': 1e-4}
+    #
+    prob.solve(solver='MOSEK', warm_start=True, mosek_params={'MSK_DPAR_OPTIMIZER_MAX_TIME': 500.0,
+                                                              })  # solver=
+    # print('x.value',x.value)  # A numpy ndarray.**
+    edge_res = []
+    # group1_res = m.getAttr(group1_selected)
+    # print('group0_res =', group0_res)
+
+    for i in range(len(edgelist)):
+        edge_res.append(
+            edge_selected[i].value)
+
+    #print('edge_res', edge_res)
+
+    # print('edge_res', edge_res)
+
+    # result0 = [i for i, x in enumerate(edge_res) if abs(x - 1) < 1e-4]
+    # print('result0',result0)
+
+    # sorted_id = sorted(range(len(edge_res)), key=lambda k: edge_res[k], reverse=True)
+    #
+    # select_edges_list = []
+    # for i in range(select_number_path):
+    #     select_edges_list.append([edgelist[sorted_id[i]][0], edgelist[sorted_id[i]][1]])
+
+    sorted_id = sorted(range(len(edge_res)), key=lambda k: edge_res[k], reverse=True)
+
+        # print('edge contribution',edge_res[sorted_id[i]])
+
+    # print('select_edges_list', select_edges_list)
+
+    return edge_res,sorted_id
+
+def normalize_ricci(kappa):
+    return (kappa + 2) / 3
+
+def smooth(arr, eps=1e-5):
+    if 0 in arr:
+        return abs(arr - eps)
+    else:
+        return arr
+def KL_divergence(P, Q):
+    # Input P and Q would be vector (like messages or priors)
+    # Will calculate the KL-divergence D-KL(P || Q) = sum~i ( P(i) * log(Q(i)/P(i)) )
+    # Refer to Wikipedia https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence
+
+    P = smooth(P)
+    Q = smooth(Q)
+    return sum(P * np.log(P / Q))

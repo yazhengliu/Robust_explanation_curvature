@@ -111,3 +111,29 @@ class NetLinkEvaluate(torch.nn.Module):
         x_0 = self.conv1(x, edge_index_1, edge_weight=edgeweight1)
         x_1 = F.relu(x_0)
         return (x_0, x_1)
+
+
+class NetLinkEvaluatePYG(torch.nn.Module):
+    """用于 GNNExplainer/PGExplainer 的模型（使用标准 PyG GCNConv）"""
+    def __init__(self, nfeat, nhid):
+        super(NetLinkEvaluatePYG, self).__init__()
+        from torch_geometric.nn import GCNConv
+        self.conv1 = GCNConv(nfeat, nhid, add_self_loops=False, normalize=False, bias=False)
+        self.conv2 = GCNConv(nhid, nhid, add_self_loops=False, normalize=False, bias=False)
+        self.linear = nn.Linear(nhid * 2, 2, bias=False)
+
+    def encode(self, x, edge_index, edge_weight):
+        x = self.conv1(x.to(torch.float32), edge_index, edge_weight=edge_weight)
+        x = x.relu()
+        return self.conv2(x, edge_index, edge_weight=edge_weight)
+
+    def decode(self, z, pos_edge_index):
+        edge_index = pos_edge_index
+        h = torch.cat([z[edge_index[0]], z[edge_index[1]]], dim=1)
+        h = self.linear(h)
+        return h
+
+    def forward(self, x, edge_index, edge_weight, pos_edge_index):
+        z = self.encode(x, edge_index, edge_weight)
+        z = self.decode(z, pos_edge_index)
+        return z

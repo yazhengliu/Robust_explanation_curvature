@@ -9,7 +9,7 @@ import optuna
 from dataclasses import dataclass
 from typing import Optional, List
 import numpy as np
-
+import copy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -23,11 +23,12 @@ from enum import Enum
 from utils.models import GCN_explainer,GCN_explainer_pyg
 from utils.link_utils import (
     SynGraphDataset, split_edge, clear_time, clear_time_UCI,
-    gen_link_data,softmax,dfs2,reverse_paths,clear,edge_percentage
+    gen_link_data,softmax,dfs2,reverse_paths,clear,edge_percentage,test_path_contribution_edge,
+map_target,mlp_contribution,main_con_edge,normalize_ricci,KL_divergence
 )
 from utils.Network import Network
 from torch_geometric.utils.loop import remove_self_loops
-from utils.models_link import NetLinkEvaluate
+from utils.models_link import NetLinkEvaluate,NetLinkEvaluatePYG
 from scipy.sparse import csr_matrix
 class RunMode(Enum):
     TRAIN = "train"      # 筛选训练节点
@@ -348,26 +349,26 @@ class LinkExplainer:
 
         return result
 
-    def val_robustness(self, edges_index, edges_weight, select_edges, num_add, num_remove,
-                       subadj, num_val, all_edges, submapping, node_idx, sub_features, output_goal):
-        """评估选定边的鲁棒性（与 deeplift_ricci_train.py 完全一致）"""
+    def val_robustness_link(self, edges_index, edges_weight, select_edges, num_add, num_remove,
+                            subadj, num_val, all_edges, sub_features, output_goal, pos_edge_index):
+        """链接预测的鲁棒性评估（与 deeplift_ricci_train.py 中的 val_robustness 一致）"""
         result_dict = dict()
         result_dict_KL = dict()
 
-        predict_old_label = np.argmax(softmax(output_goal[submapping[node_idx]].detach().numpy()))
+        predict_old_label = np.argmax(softmax(output_goal))
+
+        edges_old_dict = dict()
+        for i in range(len(edges_index[0])):
+            edges_old_dict[str(edges_index[0][i].item()) + ',' + str(edges_index[1][i].item())] = i
+
+        edges_old_dict_reverse = dict()
+        for key, value in edges_old_dict.items():
+            node_list = key.split(',')
+            edges_old_dict_reverse[value] = [int(node_list[0]), int(node_list[1])]
 
         for count in range(num_val):
             tmp_changed_edgelist = []
-            edges_old_dict = dict()
-            for i in range(len(edges_index[0])):
-                edges_old_dict[str(edges_index[0][i].item()) + ',' + str(edges_index[1][i].item())] = i
 
-            edges_old_dict_reverse = dict()
-            for key, value in edges_old_dict.items():
-                node_list = key.split(',')
-                edges_old_dict_reverse[value] = [int(node_list[0]), int(node_list[1])]
-
-            # 限制添加边的数量
             add_bound = subadj.shape[0] * (subadj.shape[0] + 1) / 2 - all_edges
             num_add_actual = min(num_add, add_bound)
 
@@ -395,7 +396,7 @@ class LinkExplainer:
                         tmp_changed_edgelist.append([remove_node_list[0], remove_node_list[1]])
                         change_num += 1
 
-            # 随机添加边（不添加已选择的重要边）
+            # 随机添加边
             change_num = 0
             while change_num < num_add_actual:
                 node_x = random.sample(list(range(subadj.shape[0])), 1)[0]
@@ -424,22 +425,23 @@ class LinkExplainer:
                         change_num += 1
 
             # 评估扰动后的预测
-            tmp_output = self.model_gnn.forward(
+            tmp_output_encode = self.model.encode(
                 sub_features,
                 torch.tensor(edges_index_new),
-                edge_weight=torch.tensor(edges_weight_new, dtype=torch.float32)
+                torch.tensor(edges_index_new),
+                edge_weight1=torch.tensor(edges_weight_new, dtype=torch.float32),
+                edge_weight2=torch.tensor(edges_weight_new, dtype=torch.float32)
             )
+            tmp_output = self.model.decode(tmp_output_encode, pos_edge_index).view(-1)
 
-            # 计算概率差值（与原始代码一致）
             result_dict[count] = float(abs(
-                softmax(tmp_output[submapping[node_idx]].detach().numpy())[predict_old_label] -
-                softmax(output_goal[submapping[node_idx]].detach().numpy())[predict_old_label]
+                softmax(tmp_output.detach().numpy())[predict_old_label] -
+                softmax(output_goal)[predict_old_label]
             ))
 
-            # 计算 KL 散度
             result_dict_KL[count] = KL_divergence(
-                softmax(output_goal[submapping[node_idx]].detach().numpy()),
-                softmax(tmp_output[submapping[node_idx]].detach().numpy())
+                softmax(output_goal),
+                softmax(tmp_output.detach().numpy())
             )
 
         return result_dict, result_dict_KL
@@ -451,145 +453,196 @@ class LinkExplainer:
             return sum(non_zero_values) / len(non_zero_values), len(non_zero_values)
         return 0, 0
 
-    def evaluate_node_with_lambda(self, node_idx: int, lam: float) -> Optional[float]:
+    def evaluate_edge_with_lambda(self, target_edge: list, lam: float) -> Optional[float]:
         """
-        评估节点在给定 lambda 下的鲁棒性差值
-        返回: prob_robust(ricci) - prob_robust(base)
-        如果 ricci 增强后更鲁棒，返回负值
+        评估边在给定 lambda 下的鲁棒性差值
+        返回: prob_robust(curvature) - prob_robust(base)
+        如果曲率增强后更鲁棒，返回负值
         """
-        # 获取边掩码
-        edge_mask = self.explain_node(node_idx, use_cache=True)
-        if edge_mask is None:
-            return None
+        # 加载子图数据
+        sub_features, sub_old, map_edge_index_old, sub_graph_old, \
+            map_edge_weight_old, map_edge_old_dict, submapping, map_edge_old_dict_reverse = \
+            self.data_loader.gen_new_edge(
+                target_edge, self.model, self.edges_old, self.clear_time_dict, self.features, self.cfg.normalize_adj
+            )
 
-        # 获取子图
-        submapping, sub_features, map_edge_index, map_edge_weight, edges_dict, subgraph, sub_adj = \
-            self.gen_data.gen_adj(node_idx, torch.tensor(self.edges_old), self.adj_old, self.x.detach().numpy())
+        goal_1 = submapping[target_edge[0]]
+        goal_2 = submapping[target_edge[1]]
 
-        # 转换为 tensor
-        if isinstance(sub_features, np.ndarray):
-            sub_features = torch.tensor(sub_features, dtype=torch.float32)
-        if isinstance(map_edge_index, list):
-            map_edge_index_tensor = torch.tensor(map_edge_index, dtype=torch.long)
-        else:
-            map_edge_index_tensor = map_edge_index
-        if isinstance(map_edge_weight, list):
-            map_edge_weight_tensor = torch.tensor(map_edge_weight, dtype=torch.float32)
-        else:
-            map_edge_weight_tensor = map_edge_weight
-
-        # 计算 Ricci 曲率
-        curvature_result = self.compute_curvature(map_edge_index, map_edge_weight, sub_adj)
+        pos_edge_index = [[goal_1], [goal_2]]
+        pos_edge_index = torch.tensor(pos_edge_index)
 
         # 模型前向传播
-        output_old = self.model_gnn.forward(sub_features, map_edge_index_tensor, map_edge_weight_tensor)
-        predict_old_label = np.argmax(softmax(output_old[submapping[node_idx]].detach().numpy()))
+        encode_logits_old = self.model.encode(
+            sub_features, map_edge_index_old, map_edge_index_old,
+            map_edge_weight_old, map_edge_weight_old
+        )
+        decode_logits_old = self.model.decode(encode_logits_old, pos_edge_index).view(-1)
+        decode_logits_old_numpy = decode_logits_old.detach().numpy()
 
-        # 获取路径和目标边
-        paths = dfs2(submapping[node_idx], submapping[node_idx], subgraph, self.cfg.layer_numbers + 1, [], [])
-        paths = reverse_paths(paths)
+        predict_old_label = np.argmax(softmax(decode_logits_old_numpy))
 
-        target_edgelist = []
-        for path in paths:
-            if [path[0], path[1]] not in target_edgelist and [path[1], path[0]] not in target_edgelist:
-                target_edgelist.append([path[0], path[1]])
-            if [path[2], path[1]] not in target_edgelist and [path[1], path[2]] not in target_edgelist:
-                target_edgelist.append([path[1], path[2]])
-        target_edgelist = clear(target_edgelist)
+        # 获取路径
+        path_ceshi_goal1 = dfs2(goal_1, goal_1, sub_graph_old, self.cfg.layer_numbers + 1, [], [])
+        target_path_1 = reverse_paths(path_ceshi_goal1)
 
-        # 计算选择的边数量
-        select_edge_important = math.ceil(self.cfg.sparsity * len(target_edgelist))
-        if select_edge_important < 1:
-            return None
+        path_ceshi_goal2 = dfs2(goal_2, goal_2, sub_graph_old, self.cfg.layer_numbers + 1, [], [])
+        target_path_2 = reverse_paths(path_ceshi_goal2)
 
-        # 准备评估参数
-        num_remove_val = math.floor(self.cfg.num_remove_val_ratio * len(target_edgelist))
-        num_add_val = math.floor(self.cfg.num_add_val_ratio * len(target_edgelist))
-        num_val = 100  # 验证次数
+        # 提取目标边列表
+        target1_changed_edgelist = []
+        for path in target_path_1:
+            key_1 = str(path[0]) + ',' + str(path[1])
+            key_2 = str(path[1]) + ',' + str(path[0])
+            key_3 = str(path[1]) + ',' + str(path[2])
+            key_4 = str(path[2]) + ',' + str(path[1])
 
-        if num_remove_val <= 0 or num_add_val <= 0:
-            return None
+            if key_1 in map_edge_old_dict.keys() or key_2 in map_edge_old_dict.keys():
+                target1_changed_edgelist.append([path[0], path[1]])
+            if key_3 in map_edge_old_dict.keys() or key_4 in map_edge_old_dict.keys():
+                target1_changed_edgelist.append([path[1], path[2]])
 
-        # 构建边索引和权重
+        target1_changed_edgelist = clear(target1_changed_edgelist)
+
+        target2_changed_edgelist = []
+        for path in target_path_2:
+            key_1 = str(path[0]) + ',' + str(path[1])
+            key_2 = str(path[1]) + ',' + str(path[0])
+            key_3 = str(path[1]) + ',' + str(path[2])
+            key_4 = str(path[2]) + ',' + str(path[1])
+
+            if key_1 in map_edge_old_dict.keys() or key_2 in map_edge_old_dict.keys():
+                target2_changed_edgelist.append([path[0], path[1]])
+            if key_3 in map_edge_old_dict.keys() or key_4 in map_edge_old_dict.keys():
+                target2_changed_edgelist.append([path[1], path[2]])
+
+        target2_changed_edgelist = clear(target2_changed_edgelist)
+
+        # 合并目标边
+        target_changed_edgelist = []
+        for edge in target1_changed_edgelist:
+            if edge not in target_changed_edgelist:
+                target_changed_edgelist.append(edge)
+        for edge in target2_changed_edgelist:
+            if edge not in target_changed_edgelist:
+                target_changed_edgelist.append(edge)
+
+        # 检查边数量
+        num_remove_val = math.floor(
+            self.cfg.num_remove_val_ratio * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+        num_add_val = math.floor(
+            self.cfg.num_add_val_ratio * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+
+        if len(target_changed_edgelist) < 20 or num_remove_val <= 0 or num_add_val <= 0:
+            return 0
+
+        # 构建 target_edgelist_index 和 weight
+        all_edges_list = []
+        for edge in target1_changed_edgelist:
+            if [edge[0], edge[1]] not in all_edges_list and [edge[1], edge[0]] not in all_edges_list:
+                all_edges_list.append(edge)
+        for edge in target2_changed_edgelist:
+            if [edge[0], edge[1]] not in all_edges_list and [edge[1], edge[0]] not in all_edges_list:
+                all_edges_list.append(edge)
+
         target_edgelist_index = [[], []]
         target_edgelist_weight = []
-        for edge in target_edgelist:
+        for edge in all_edges_list:
             if edge[0] != edge[1]:
                 target_edgelist_index[0].append(edge[0])
                 target_edgelist_index[1].append(edge[1])
-                target_edgelist_weight.append(sub_adj[edge[0], edge[1]])
+                target_edgelist_weight.append(sub_old[edge[0], edge[1]])
                 target_edgelist_index[0].append(edge[1])
                 target_edgelist_index[1].append(edge[0])
-                target_edgelist_weight.append(sub_adj[edge[1], edge[0]])
+                target_edgelist_weight.append(sub_old[edge[1], edge[0]])
             else:
                 target_edgelist_index[0].append(edge[0])
                 target_edgelist_index[1].append(edge[1])
-                target_edgelist_weight.append(sub_adj[edge[0], edge[1]])
+                target_edgelist_weight.append(sub_old[edge[0], edge[1]])
 
         target_edgelist_index = torch.LongTensor(target_edgelist_index)
         target_edgelist_weight = torch.tensor(target_edgelist_weight, dtype=torch.float32)
 
-        # ========== 基础选择（不使用 Ricci）==========
+        # 获取 edge_mask
+        edge_mask = self.explain_edge(target_edge, use_cache=True)
+        if edge_mask is None:
+            return 0
+
+        # 计算曲率
+        curvature_result = self.compute_curvature(map_edge_index_old, map_edge_weight_old, sub_old)
+
+        # 计算选择的边数量
+        select_edge_important = math.ceil(
+            self.cfg.sparsity * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+
+        # ========== 基础选择（不使用曲率）==========
         if self.cfg.method == "convex":
-            # convex 方法: edge_mask 对应 target_edgelist
-            edge_index_for_mask = target_edgelist
+            # Convex 方法: edge_mask 对应 target_changed_edgelist
+            # edge_mask 是 list 形式，长度等于 target_changed_edgelist
             total_result_base = dict()
-            for i, edge in enumerate(target_edgelist):
+            for i, edge in enumerate(target_changed_edgelist):
                 edge_str = str(edge[0]) + ',' + str(edge[1])
                 if i < len(edge_mask):
-                    total_result_base[edge_str] = edge_mask[i].item()
+                    total_result_base[edge_str] = edge_mask[i] if isinstance(edge_mask[i], (int, float)) else edge_mask[
+                        i].item()
         else:
-            # 其他方法: edge_mask 对应 map_edge_index
+            # DeepLIFT, FlowX, GNN-LRP: edge_mask 对应 map_edge_index_old
             total_result_base = dict()
-            for i in range(len(map_edge_index[0])):
-                edge_str = str(map_edge_index[0][i]) + ',' + str(map_edge_index[1][i])
+            for i in range(len(map_edge_index_old[0])):
+                edge_str = str(map_edge_index_old[0][i].item()) + ',' + str(map_edge_index_old[1][i].item())
                 total_result_base[edge_str] = edge_mask[i].item()
 
-        sort_diff_base = sorted(total_result_base.items(), key=lambda x: x[1], reverse=True)
+        sort_diff_base = sorted(total_result_base.items(), key=lambda item: item[1], reverse=True)
 
-        select_gnn_base_edgelist = []
-        select_idx = 0
-        while len(select_gnn_base_edgelist) < select_edge_important and select_idx < len(sort_diff_base):
-            edge_str = sort_diff_base[select_idx][0]
-            nodes = [int(n) for n in edge_str.split(',')]
-            if nodes not in select_gnn_base_edgelist and [nodes[1], nodes[0]] not in select_gnn_base_edgelist:
-                select_gnn_base_edgelist.append(nodes)
-            select_idx += 1
+        count_number = 0
+        select_edges_list_old_base = []
+        i = 0
+        while count_number < select_edge_important and i < len(sort_diff_base):
+            tmp = []
+            s1 = sort_diff_base[i][0].split(',')
+            for j in s1:
+                tmp.append(int(j))
+            if [tmp[0], tmp[1]] not in select_edges_list_old_base and [tmp[1],
+                                                                       tmp[0]] not in select_edges_list_old_base:
+                select_edges_list_old_base.append(tmp)
+                count_number += 1
+            i += 1
 
-        # ========== Ricci 增强选择 ==========
+        # ========== 曲率增强选择 ==========
         if self.cfg.method == "convex":
             total_result_curvature = dict()
-            for i, edge in enumerate(target_edgelist):
+            for i, edge in enumerate(target_changed_edgelist):
                 edge_str = str(edge[0]) + ',' + str(edge[1])
-                curvature_val = curvature_result[edge_str]
+                curvature_val = curvature_result.get(edge_str, 0)
                 if i < len(edge_mask):
-                    total_result_curvature[edge_str] = self.compute_combined_score(
-                        edge_mask[i].item(), curvature_val, lam
-                    )
+                    mask_val = edge_mask[i] if isinstance(edge_mask[i], (int, float)) else edge_mask[i].item()
+                    total_result_curvature[edge_str] = self.compute_combined_score(mask_val, curvature_val, lam)
         else:
             total_result_curvature = dict()
-            for i in range(len(map_edge_index[0])):
-                edge_str = str(map_edge_index[0][i]) + ',' + str(map_edge_index[1][i])
-                curvature_val = curvature_result[edge_str]
-                total_result_curvature[edge_str] = self.compute_combined_score(
-                    edge_mask[i].item(), curvature_val, lam
-                )
+            for i in range(len(map_edge_index_old[0])):
+                edge_str = str(map_edge_index_old[0][i].item()) + ',' + str(map_edge_index_old[1][i].item())
+                curvature_val = curvature_result.get(edge_str, 0)
+                total_result_curvature[edge_str] = self.compute_combined_score(edge_mask[i].item(), curvature_val, lam)
 
-        sort_diff_ricci = sorted(total_result_curvature.items(), key=lambda x: x[1], reverse=True)
+        sort_diff_curvature = sorted(total_result_curvature.items(), key=lambda item: item[1], reverse=True)
 
-        select_gnn_edgelist = []
-        select_idx = 0
-        while len(select_gnn_edgelist) < select_edge_important and select_idx < len(sort_diff_ricci):
-            edge_str = sort_diff_ricci[select_idx][0]
-            nodes = [int(n) for n in edge_str.split(',')]
-            if nodes not in select_gnn_edgelist and [nodes[1], nodes[0]] not in select_gnn_edgelist:
-                select_gnn_edgelist.append(nodes)
-            select_idx += 1
+        count_number = 0
+        select_edges_list_old = []
+        i = 0
+        while count_number < select_edge_important and i < len(sort_diff_curvature):
+            tmp = []
+            s1 = sort_diff_curvature[i][0].split(',')
+            for j in s1:
+                tmp.append(int(j))
+            if [tmp[0], tmp[1]] not in select_edges_list_old and [tmp[1], tmp[0]] not in select_edges_list_old:
+                select_edges_list_old.append(tmp)
+                count_number += 1
+            i += 1
 
-        # ========== 检查选择是否不同 ==========
+        # 检查选择是否不同
         select_flag = True
-        for edge in select_gnn_edgelist:
-            if edge not in select_gnn_base_edgelist and [edge[1], edge[0]] not in select_gnn_base_edgelist:
+        for edge in select_edges_list_old:
+            if edge not in select_edges_list_old_base and [edge[1], edge[0]] not in select_edges_list_old_base:
                 select_flag = False
                 break
 
@@ -598,99 +651,156 @@ class LinkExplainer:
             return 0
 
         # ========== 评估鲁棒性 ==========
-        # Ricci 增强后的鲁棒性
-        result_val_prob_ricci, result_val_kl_ricci = self.val_robustness(
-            target_edgelist_index, target_edgelist_weight, select_gnn_edgelist,
-            num_add_val, num_remove_val, sub_adj, num_val, len(target_edgelist),
-            submapping, node_idx, sub_features, output_old
+        num_val = 100
+
+        # 曲率增强后的鲁棒性
+        result_val_prob, result_val_kl = self.val_robustness_link(
+            target_edgelist_index, target_edgelist_weight, select_edges_list_old,
+            num_add_val, num_remove_val, sub_old, num_val, len(target_changed_edgelist),
+            sub_features, decode_logits_old_numpy, pos_edge_index
         )
-        prob_robust, _ = self.ave(result_val_prob_ricci)
+        prob_robust, _ = self.ave(result_val_prob)
 
         # 基础选择的鲁棒性
-        result_val_prob_base, result_val_kl_base= self.val_robustness(
-            target_edgelist_index, target_edgelist_weight, select_gnn_base_edgelist,
-            num_add_val, num_remove_val, sub_adj, num_val, len(target_edgelist),
-            submapping, node_idx, sub_features, output_old
+        result_val_prob_base, result_val_kl_base = self.val_robustness_link(
+            target_edgelist_index, target_edgelist_weight, select_edges_list_old_base,
+            num_add_val, num_remove_val, sub_old, num_val, len(target_changed_edgelist),
+            sub_features, decode_logits_old_numpy, pos_edge_index
         )
         prob_robust_base, _ = self.ave(result_val_prob_base)
 
-        # 返回差值：如果 Ricci 增强更鲁棒，prob_robust 更小，差值为负
+        # 返回差值
         return prob_robust - prob_robust_base
 
-    def evaluate_val_node(self, node_idx: int, good_lambdas_list: list):
+    def evaluate_val_edge(self, target_edge: list, good_lambdas_list: list):
+        """评估验证边在多个 lambda 下的鲁棒性，并保存结果"""
 
-        # 获取子图
-        submapping, sub_features, map_edge_index, map_edge_weight, edges_dict, subgraph, sub_adj = \
-            self.gen_data.gen_adj(node_idx, torch.tensor(self.edges_old), self.adj_old, self.x.detach().numpy())
+        # 加载子图数据
+        sub_features, sub_old, map_edge_index_old, sub_graph_old, \
+            map_edge_weight_old, map_edge_old_dict, submapping, map_edge_old_dict_reverse = \
+            self.data_loader.gen_new_edge(
+                target_edge, self.model, self.edges_old, self.clear_time_dict, self.features, self.cfg.normalize_adj
+            )
 
-        # 转换为 tensor
-        if isinstance(sub_features, np.ndarray):
-            sub_features = torch.tensor(sub_features, dtype=torch.float32)
-        if isinstance(map_edge_index, list):
-            map_edge_index = torch.tensor(map_edge_index, dtype=torch.long)
-        if isinstance(map_edge_weight, list):
-            map_edge_weight = torch.tensor(map_edge_weight, dtype=torch.float32)
+        goal_1 = submapping[target_edge[0]]
+        goal_2 = submapping[target_edge[1]]
+
+        pos_edge_index = [[goal_1], [goal_2]]
+        pos_edge_index = torch.tensor(pos_edge_index)
 
         # 模型前向传播
-        output_old = self.model_gnn.forward(sub_features, map_edge_index, map_edge_weight)
-        predict_old_label = np.argmax(softmax(output_old[submapping[node_idx]].detach().numpy()))
+        encode_logits_old = self.model.encode(
+            sub_features, map_edge_index_old, map_edge_index_old,
+            map_edge_weight_old, map_edge_weight_old
+        )
+        decode_logits_old = self.model.decode(encode_logits_old, pos_edge_index).view(-1)
+        decode_logits_old_numpy = decode_logits_old.detach().numpy()
 
-        # 获取路径和目标边
-        paths = dfs2(submapping[node_idx], submapping[node_idx], subgraph, self.cfg.layer_numbers + 1, [], [])
-        paths = reverse_paths(paths)
+        predict_old_label = np.argmax(softmax(decode_logits_old_numpy))
 
-        target_edgelist = []
-        for path in paths:
-            if [path[0], path[1]] not in target_edgelist and [path[1], path[0]] not in target_edgelist:
-                target_edgelist.append([path[0], path[1]])
-            if [path[2], path[1]] not in target_edgelist and [path[1], path[2]] not in target_edgelist:
-                target_edgelist.append([path[1], path[2]])
-        target_edgelist = clear(target_edgelist)
+        # 获取路径
+        path_ceshi_goal1 = dfs2(goal_1, goal_1, sub_graph_old, self.cfg.layer_numbers + 1, [], [])
+        target_path_1 = reverse_paths(path_ceshi_goal1)
 
-        # 检查边数量条件
-        num_remove_val = math.floor(self.cfg.num_remove_val_ratio * len(target_edgelist))
-        num_add_val = math.floor(self.cfg.num_add_val_ratio * len(target_edgelist))
+        path_ceshi_goal2 = dfs2(goal_2, goal_2, sub_graph_old, self.cfg.layer_numbers + 1, [], [])
+        target_path_2 = reverse_paths(path_ceshi_goal2)
 
-        if len(target_edgelist) < 20 or num_remove_val <= 0 or num_add_val <= 0:
-            print(f"Node {node_idx}: Skipped (edges={len(target_edgelist)})")
+        # 提取目标边列表
+        target1_changed_edgelist = []
+        for path in target_path_1:
+            key_1 = str(path[0]) + ',' + str(path[1])
+            key_2 = str(path[1]) + ',' + str(path[0])
+            key_3 = str(path[1]) + ',' + str(path[2])
+            key_4 = str(path[2]) + ',' + str(path[1])
+
+            if key_1 in map_edge_old_dict.keys() or key_2 in map_edge_old_dict.keys():
+                target1_changed_edgelist.append([path[0], path[1]])
+            if key_3 in map_edge_old_dict.keys() or key_4 in map_edge_old_dict.keys():
+                target1_changed_edgelist.append([path[1], path[2]])
+
+        target1_changed_edgelist = clear(target1_changed_edgelist)
+
+        target2_changed_edgelist = []
+        for path in target_path_2:
+            key_1 = str(path[0]) + ',' + str(path[1])
+            key_2 = str(path[1]) + ',' + str(path[0])
+            key_3 = str(path[1]) + ',' + str(path[2])
+            key_4 = str(path[2]) + ',' + str(path[1])
+
+            if key_1 in map_edge_old_dict.keys() or key_2 in map_edge_old_dict.keys():
+                target2_changed_edgelist.append([path[0], path[1]])
+            if key_3 in map_edge_old_dict.keys() or key_4 in map_edge_old_dict.keys():
+                target2_changed_edgelist.append([path[1], path[2]])
+
+        target2_changed_edgelist = clear(target2_changed_edgelist)
+
+        # 合并目标边
+        target_changed_edgelist = []
+        for edge in target1_changed_edgelist:
+            if edge not in target_changed_edgelist:
+                target_changed_edgelist.append(edge)
+        for edge in target2_changed_edgelist:
+            if edge not in target_changed_edgelist:
+                target_changed_edgelist.append(edge)
+
+        # 检查边数量
+        num_remove_val = math.floor(
+            self.cfg.num_remove_val_ratio * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+        num_add_val = math.floor(
+            self.cfg.num_add_val_ratio * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+
+        if len(target_changed_edgelist) < 20 or num_remove_val <= 0 or num_add_val <= 0:
+            print(f"Edge {target_edge}: Skipped (edges={len(target_changed_edgelist)})")
             return
 
-        # 构建目标边的索引和权重
+        # 构建 target_edgelist_index 和 weight
+        all_edges_list = []
+        for edge in target1_changed_edgelist:
+            if [edge[0], edge[1]] not in all_edges_list and [edge[1], edge[0]] not in all_edges_list:
+                all_edges_list.append(edge)
+        for edge in target2_changed_edgelist:
+            if [edge[0], edge[1]] not in all_edges_list and [edge[1], edge[0]] not in all_edges_list:
+                all_edges_list.append(edge)
+
         target_edgelist_index = [[], []]
         target_edgelist_weight = []
-        for edge in target_edgelist:
+        for edge in all_edges_list:
             if edge[0] != edge[1]:
                 target_edgelist_index[0].append(edge[0])
                 target_edgelist_index[1].append(edge[1])
-                target_edgelist_weight.append(sub_adj[edge[0], edge[1]])
+                target_edgelist_weight.append(sub_old[edge[0], edge[1]])
                 target_edgelist_index[0].append(edge[1])
                 target_edgelist_index[1].append(edge[0])
-                target_edgelist_weight.append(sub_adj[edge[1], edge[0]])
+                target_edgelist_weight.append(sub_old[edge[1], edge[0]])
             else:
                 target_edgelist_index[0].append(edge[0])
                 target_edgelist_index[1].append(edge[1])
-                target_edgelist_weight.append(sub_adj[edge[0], edge[1]])
+                target_edgelist_weight.append(sub_old[edge[0], edge[1]])
 
         target_edgelist_index = torch.LongTensor(target_edgelist_index)
         target_edgelist_weight = torch.tensor(target_edgelist_weight, dtype=torch.float32)
 
-        # 计算 Ricci 曲率
-        curvature_result = self.compute_curvature(map_edge_index, map_edge_weight, sub_adj)
+        # 计算曲率
+        curvature_result = self.compute_curvature(map_edge_index_old, map_edge_weight_old, sub_old)
 
-        # 获取边掩码
-        edge_mask = self.explain_node(node_idx, use_cache=True)
+        # 获取 edge_mask
+        edge_mask = self.explain_edge(target_edge, use_cache=True)
         if edge_mask is None:
             return
 
         # 边选择数量
-        select_edge_important = math.ceil(self.cfg.sparsity * len(target_edgelist))
+        select_edge_important = math.ceil(
+            self.cfg.sparsity * (len(target1_changed_edgelist) + len(target2_changed_edgelist)))
+
+        num_val = 100
 
         # 随机选择边的鲁棒性（作为基准）
-        random_select_edges = random.sample(target_edgelist, min(select_edge_important, len(target_edgelist)))
-        withoutcon_result_val_prob, withoutcon_result_val_kl = self.val_robustness(
+        random_select_edges = random.sample(target_changed_edgelist,
+                                            min(select_edge_important, len(target_changed_edgelist)))
+        withoutcon_result_val_prob, withoutcon_result_val_kl = self.val_robustness_link(
             target_edgelist_index, target_edgelist_weight, random_select_edges,
-            num_add_val, num_remove_val, sub_adj, 100, len(target_edgelist),
-            submapping, node_idx, sub_features, output_old
+            num_add_val, num_remove_val, sub_old, num_val, len(target_changed_edgelist),
+            sub_features, decode_logits_old_numpy, pos_edge_index
         )
 
         # 对每个 lambda 进行评估
@@ -699,17 +809,18 @@ class LinkExplainer:
             result_important_base_dict = dict()
             save_flag = False
 
-            # ========== 基础选择（不使用 Ricci）==========
+            # ========== 基础选择（不使用曲率）==========
             if self.cfg.method == "convex":
                 total_result_base = dict()
-                for i, edge in enumerate(target_edgelist):
+                for i, edge in enumerate(target_changed_edgelist):
                     edge_str = str(edge[0]) + ',' + str(edge[1])
                     if i < len(edge_mask):
-                        total_result_base[edge_str] = edge_mask[i].item()
+                        total_result_base[edge_str] = edge_mask[i] if isinstance(edge_mask[i], (int, float)) else \
+                        edge_mask[i].item()
             else:
                 total_result_base = dict()
-                for i in range(len(map_edge_index[0])):
-                    edge_str = str(map_edge_index[0][i].item()) + ',' + str(map_edge_index[1][i].item())
+                for i in range(len(map_edge_index_old[0])):
+                    edge_str = str(map_edge_index_old[0][i].item()) + ',' + str(map_edge_index_old[1][i].item())
                     total_result_base[edge_str] = edge_mask[i].item()
 
             sort_diff_base = sorted(total_result_base.items(), key=lambda x: x[1], reverse=True)
@@ -723,31 +834,29 @@ class LinkExplainer:
                     select_gnn_base_edgelist.append(nodes)
                 select_idx += 1
 
-            # ========== based curvature ==========
+            # ========== 曲率增强选择 ==========
             if self.cfg.method == "convex":
                 total_result_curvature = dict()
-                for i, edge in enumerate(target_edgelist):
+                for i, edge in enumerate(target_changed_edgelist):
                     edge_str = str(edge[0]) + ',' + str(edge[1])
-                    curvature_val = curvature_result[edge_str]
+                    curvature_val = curvature_result.get(edge_str, 0)
                     if i < len(edge_mask):
-                        total_result_curvature[edge_str] = self.compute_combined_score(
-                            edge_mask[i].item(), curvature_val, lam
-                        )
+                        mask_val = edge_mask[i] if isinstance(edge_mask[i], (int, float)) else edge_mask[i].item()
+                        total_result_curvature[edge_str] = self.compute_combined_score(mask_val, curvature_val, lam)
             else:
                 total_result_curvature = dict()
-                for i in range(len(map_edge_index[0])):
-                    edge_str = str(map_edge_index[0][i].item()) + ',' + str(map_edge_index[1][i].item())
-                    curvature_val = curvature_result[edge_str]
-                    total_result_curvature[edge_str] = self.compute_combined_score(
-                        edge_mask[i].item(), curvature_val, lam
-                    )
+                for i in range(len(map_edge_index_old[0])):
+                    edge_str = str(map_edge_index_old[0][i].item()) + ',' + str(map_edge_index_old[1][i].item())
+                    curvature_val = curvature_result.get(edge_str, 0)
+                    total_result_curvature[edge_str] = self.compute_combined_score(edge_mask[i].item(), curvature_val,
+                                                                                   lam)
 
-            sort_diff_ricci = sorted(total_result_curvature.items(), key=lambda x: x[1], reverse=True)
+            sort_diff_curvature = sorted(total_result_curvature.items(), key=lambda x: x[1], reverse=True)
 
             select_gnn_edgelist = []
             select_idx = 0
-            while len(select_gnn_edgelist) < select_edge_important and select_idx < len(sort_diff_ricci):
-                edge_str = sort_diff_ricci[select_idx][0]
+            while len(select_gnn_edgelist) < select_edge_important and select_idx < len(sort_diff_curvature):
+                edge_str = sort_diff_curvature[select_idx][0]
                 nodes = [int(n) for n in edge_str.split(',')]
                 if nodes not in select_gnn_edgelist and [nodes[1], nodes[0]] not in select_gnn_edgelist:
                     select_gnn_edgelist.append(nodes)
@@ -763,32 +872,16 @@ class LinkExplainer:
             if not select_flag:
                 save_flag = True
 
-                # 评估 Ricci 增强的选择
-                evaluate_edge_index, evaluate_edge_weight = from_edges_to_evaulate(
-                    select_gnn_edgelist, torch.tensor([]), [[], []], dict(),
-                    csr_matrix(sub_adj.shape), sub_adj
-                )
-                evaluate_edge_index = torch.tensor(evaluate_edge_index).to(torch.int64)
-                evaluate_edge_weight = torch.tensor(evaluate_edge_weight, dtype=torch.float32)
-
-                evaluate_edge_output = self.model_gnn.forward(sub_features, evaluate_edge_index,
-                                                              edge_weight=evaluate_edge_weight)
-
-                KL_edge_ricci = KL_divergence(
-                    softmax(output_old[submapping[node_idx]].detach().numpy()),
-                    softmax(evaluate_edge_output[submapping[node_idx]].detach().numpy())
-                )
-
-                result_val_prob, result_val_kl = self.val_robustness(
+                # 评估曲率增强的选择
+                result_val_prob, result_val_kl = self.val_robustness_link(
                     target_edgelist_index, target_edgelist_weight, select_gnn_edgelist,
-                    num_add_val, num_remove_val, sub_adj, 100, len(target_edgelist),
-                    submapping, node_idx, sub_features, output_old
+                    num_add_val, num_remove_val, sub_old, num_val, len(target_changed_edgelist),
+                    sub_features, decode_logits_old_numpy, pos_edge_index
                 )
 
                 idx_important = 0
                 result_important_dict[f'{idx_important},select {self.cfg.method} edge'] = [[int(e[0]), int(e[1])] for e
                                                                                            in select_gnn_edgelist]
-                result_important_dict[f'{idx_important},select {self.cfg.method} edgeKL'] = KL_edge_ricci
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl
                 result_important_dict[
@@ -797,31 +890,15 @@ class LinkExplainer:
                     f'{idx_important},robustness {self.cfg.method} kl withoutcon'] = withoutcon_result_val_kl
 
                 # 评估基础选择
-                evaluate_edge_index_base, evaluate_edge_weight_base = from_edges_to_evaulate(
-                    select_gnn_base_edgelist, torch.tensor([]), [[], []], dict(),
-                    csr_matrix(sub_adj.shape), sub_adj
-                )
-                evaluate_edge_index_base = torch.tensor(evaluate_edge_index_base).to(torch.int64)
-                evaluate_edge_weight_base = torch.tensor(evaluate_edge_weight_base, dtype=torch.float32)
-
-                evaluate_edge_output_base = self.model_gnn.forward(sub_features, evaluate_edge_index_base,
-                                                                   edge_weight=evaluate_edge_weight_base)
-
-                KL_edge_base = KL_divergence(
-                    softmax(output_old[submapping[node_idx]].detach().numpy()),
-                    softmax(evaluate_edge_output_base[submapping[node_idx]].detach().numpy())
-                )
-
-                result_val_prob_base, result_val_kl_base = self.val_robustness(
+                result_val_prob_base, result_val_kl_base = self.val_robustness_link(
                     target_edgelist_index, target_edgelist_weight, select_gnn_base_edgelist,
-                    num_add_val, num_remove_val, sub_adj, 100, len(target_edgelist),
-                    submapping, node_idx, sub_features, output_old
+                    num_add_val, num_remove_val, sub_old, num_val, len(target_changed_edgelist),
+                    sub_features, decode_logits_old_numpy, pos_edge_index
                 )
 
                 result_important_base_dict[f'{idx_important},select {self.cfg.method} edge'] = [[int(e[0]), int(e[1])]
                                                                                                 for e in
                                                                                                 select_gnn_base_edgelist]
-                result_important_base_dict[f'{idx_important},select {self.cfg.method} edgeKL'] = KL_edge_base
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob_base
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl_base
                 result_important_base_dict[
@@ -831,34 +908,17 @@ class LinkExplainer:
 
             # 保存结果
             if save_flag:
-                norm_dir = "normalize" if self.cfg.normalize_adj else "no_normalize"
+                save_dir = self.get_lambda_save_dir()
+                lam_save_dir = os.path.join(save_dir, str(lam), self.cfg.curvature_type)
+                os.makedirs(lam_save_dir, exist_ok=True)
 
-
-                # 保存 Ricci 增强结果
-                ricci_save_dir = os.path.join(
-                    self.cfg.result_root, norm_dir, "ricci",
-                    self.modelname, self.cfg.method,
-                    f"{self.cfg.num_add_val_ratio}_{self.cfg.num_remove_val_ratio}",
-                     str(lam), "ricci"
-                )
-                os.makedirs(ricci_save_dir, exist_ok=True)
-
-                with open(os.path.join(ricci_save_dir, f"{node_idx}.json"), 'w') as f:
+                edge_str = f"{target_edge[0]}_{target_edge[1]}"
+                with open(os.path.join(lam_save_dir, f"{edge_str}.json"), 'w') as f:
                     json.dump(result_important_dict, f)
-
-                # 保存基础结果
-                base_save_dir = os.path.join(
-                    self.cfg.result_root,  norm_dir, "ricci",
-                    self.modelname, self.cfg.method,
-                    f"{self.cfg.num_add_val_ratio}_{self.cfg.num_remove_val_ratio}",
-                     str(lam), "base"
-                )
-                os.makedirs(base_save_dir, exist_ok=True)
-
-                with open(os.path.join(base_save_dir, f"{node_idx}.json"), 'w') as f:
+                with open(os.path.join(lam_save_dir, f"{edge_str}_base.json"), 'w') as f:
                     json.dump(result_important_base_dict, f)
 
-                print(f"Node {node_idx}, Lambda {lam}: Results saved")
+                print(f"Edge {target_edge}: Saved results for lambda={lam}")
 
 
     def run(self):
@@ -978,19 +1038,40 @@ class LinkExplainer:
 
         # 创建用于评估的模型（与主模型共享权重）
 
+        if self.cfg.method in ["gnnexplainer", "pgexplainer"]:
+            self.evaulate_model = NetLinkEvaluatePYG(
+                nfeat=self.data.num_features,
+                nhid=self.cfg.hidden_dim
+            ).to(self.cfg.device)
 
-        self.evaulate_model = NetLinkEvaluate(
-            nfeat=self.data.num_features,
-            nhid=self.cfg.hidden_dim
-        ).to(self.cfg.device)
-        self.evaulate_model.eval()
 
-        # 复制权重到评估模型
+        else:
+            self.evaulate_model = NetLinkEvaluate(
+                nfeat=self.data.num_features,
+                nhid=self.cfg.hidden_dim
+            ).to(self.cfg.device)
+
         eval_model_dict = self.evaulate_model.state_dict()
-        eval_model_dict['conv1.weight'] = self.model.state_dict()['conv1.lin.weight'].t()
-        eval_model_dict['conv2.weight'] = self.model.state_dict()['conv2.lin.weight'].t()
-        eval_model_dict['linear.weight'] = self.model.state_dict()['linear.weight']
+        if self.cfg.method in ["gnnexplainer", "pgexplainer"]:
+            # 标准 PyG GCNConv 使用 conv1.lin.weight
+            eval_model_dict['conv1.lin.weight'] = self.model.state_dict()['conv1.lin.weight']
+            eval_model_dict['conv2.lin.weight'] = self.model.state_dict()['conv2.lin.weight']
+            eval_model_dict['linear.weight'] = self.model.state_dict()['linear.weight']
+        else:
+            # GCNConvExplainer 使用 conv1.weight，需要转置
+            eval_model_dict['conv1.weight'] = self.model.state_dict()['conv1.lin.weight'].t()
+            eval_model_dict['conv2.weight'] = self.model.state_dict()['conv2.lin.weight'].t()
+            eval_model_dict['linear.weight'] = self.model.state_dict()['linear.weight']
+
+            # self.evaulate_model.eval()
+            # # 复制权重到评估模型
+            # eval_model_dict = self.evaulate_model.state_dict()
+            # eval_model_dict['conv1.weight'] = self.model.state_dict()['conv1.lin.weight'].t()
+            # eval_model_dict['conv2.weight'] = self.model.state_dict()['conv2.lin.weight'].t()
+            # eval_model_dict['linear.weight'] = self.model.state_dict()['linear.weight']
         self.evaulate_model.load_state_dict(eval_model_dict)
+
+
 
 
 
@@ -1220,16 +1301,31 @@ class LinkExplainer:
         # 缓存路径
         save_dir = self.get_save_dir()
         edge_str = f"{target_edge[0]}_{target_edge[1]}"
-        save_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.npy")
+        if self.cfg.method == "convex":
+            cache_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.json")
+        else:
+            cache_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.npy")
 
-        if use_cache and os.path.exists(save_path):
-            edge_mask_array = np.load(save_path)
-            edge_mask = torch.tensor(edge_mask_array, dtype=torch.float32)
-            print(f"Edge {target_edge}: Loaded from cache")
+        if use_cache and os.path.exists(cache_path):
+            if self.cfg.method == "convex":
+                json_save_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.json")
+                if os.path.exists(json_save_path):
+                    with open(json_save_path, 'r') as f:
+                        select_edges_list_value = json.load(f)
+                    edge_mask = torch.tensor(select_edges_list_value, dtype=torch.float32)
+                    print(f"Edge {target_edge}: Loaded from cache")
+                    return edge_mask
+            else:
+                npy_save_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.npy")
+                if os.path.exists(npy_save_path):
+                    edge_mask_array = np.load(npy_save_path)
+                    edge_mask = torch.tensor(edge_mask_array, dtype=torch.float32)
+                    print(f"Edge {target_edge}: Loaded from cache")
+                    return edge_mask
         else:
             if self.cfg.method == "deeplift":
                 # print('deeplift',deeplift)
-                from dig.xgraph.method import DeepLIFT_link
+                from baselines.dig.xgraph.method import DeepLIFT_link
                 explainer = DeepLIFT_link(self.evaulate_model, explain_graph=True)
                 sparsity = 0
 
@@ -1242,7 +1338,7 @@ class LinkExplainer:
                 edge_mask = masks_old[0]
 
             elif self.cfg.method == "flowx":
-                from dig.xgraph.method import FlowMask_link
+                from baselines.dig.xgraph.method import FlowMask_link
 
                 explainer = FlowMask_link(self.evaulate_model, explain_graph=True)
                 sparsity = 0
@@ -1252,10 +1348,10 @@ class LinkExplainer:
                                             given_class=predict_old_label,
                                             edge_weight=map_edge_weight_old, pos_edge_index=pos_edge_index)
 
-                edge_mask_old = masks_old[0]
+                edge_mask = masks_old[0]
 
             elif self.cfg.method == "gnnlrp":
-                from dig.xgraph.method import GNN_LRP_link
+                from baselines.dig.xgraph.method import GNN_LRP_link
                 explainer = GNN_LRP_link(self.evaulate_model, explain_graph=True)
                 sparsity = 0
 
@@ -1265,17 +1361,19 @@ class LinkExplainer:
                                             goal_1=goal_1,
                                             goal_2=goal_2)
 
-                edge_mask_old = masks_old[0]
+                edge_mask = masks_old[0]
+
+                edge_mask = custom_log_transform(edge_mask)
             elif self.cfg.method == "convex":
-                relu_delta, relu_end, relu_start = self.gen_data.gen_parameters_v2(
-                    sub_features, map_edge_index, map_edge_weight, self.model_gnn
+                relu_delta, relu_end, relu_start = self.data_loader.gen_parameters_v2(
+                    self.model, sub_features, map_edge_index_old, map_edge_weight_old
                 )
 
-                _, _, test_edge_result = test_path_contribution_edge(
-                    paths,
-                    csr_matrix(sub_adj.shape),
-                    sub_adj,
-                    target_edgelist,
+                _, _, test_edge_result_1 = test_path_contribution_edge(
+                    target_path_1,
+                    csr_matrix(sub_old.shape),
+                    sub_old,
+                    target1_changed_edgelist,
                     relu_delta,
                     relu_start,
                     relu_end,
@@ -1283,74 +1381,114 @@ class LinkExplainer:
                     self.W1,
                     self.W2
                 )
+                target1_edge_result = map_target(test_edge_result_1, goal_1)
 
-                target_edge_result = map_target(test_edge_result, node_idx_mapped)
+                # 计算 goal_2 的边贡献
+                _, _, test_edge_result_2 = test_path_contribution_edge(
+                    target_path_2,
+                    csr_matrix(sub_old.shape),
+                    sub_old,
+                    target2_changed_edgelist,
+                    relu_delta,
+                    relu_start,
+                    relu_end,
+                    sub_features,
+                    self.W1,
+                    self.W2
+                )
+                target2_edge_result = map_target(test_edge_result_2, goal_2)
 
-                # 计算边的重要性分数
-                select_edge_important = math.ceil(self.cfg.sparsity * len(target_edgelist))
-                select_edges_list_value, _ = main_con_edge(
+                # 应用 MLP 贡献（W3 分为两半，对应两个节点的 embedding 拼接）
+                final_target1_edge_result = mlp_contribution(
+                    target1_edge_result,
+                    self.W3[:encode_logits_old.shape[1]].detach().numpy()
+                )
+                final_target2_edge_result = mlp_contribution(
+                    target2_edge_result,
+                    self.W3[encode_logits_old.shape[1]:].detach().numpy()
+                )
+
+                # 合并两个目标节点的边贡献
+                target_edge_result = dict()
+                for key, value in final_target1_edge_result.items():
+                    if key not in target_edge_result.keys():
+                        target_edge_result[key] = value
+                    else:
+                        target_edge_result[key] += value
+
+                for key, value in final_target2_edge_result.items():
+                    if key not in target_edge_result.keys():
+                        target_edge_result[key] = value
+                    else:
+                        target_edge_result[key] += value
+
+                # 计算选择的边数量
+                select_edge_important = math.ceil(
+                    self.cfg.sparsity * (len(target1_changed_edgelist) + len(target2_changed_edgelist))
+                )
+
+                # 使用凸优化计算边的重要性分数
+                select_edges_list_value, select_edges_list_sort = main_con_edge(
                     select_edge_important,
-                    node_idx_mapped,
                     target_edge_result,
-                    target_edgelist,
-                    torch.zeros_like(output[node_idx_mapped]).numpy(),
-                    output
+                    target_changed_edgelist,
+                    [0, 0],  # old_tensor (初始化为 0)
+                    decode_logits_old_numpy
                 )
 
                 edge_mask = torch.tensor(select_edges_list_value, dtype=torch.float32)
 
             elif self.cfg.method == "gnnexplainer":
-                from torch_geometric.explain import GNNExplainer, Explainer
+                from baselines.torch_geometric.explain import GNNExplainer, Explainer
 
                 explainer = Explainer(
-                    model=self.model_gnn,
-                    algorithm=GNNExplainer(epochs=200, lr=0.001),
-                    explanation_type='model',
+                    model=self.evaulate_model,
+                    explanation_type='phenomenon',
+                    algorithm=GNNExplainer(epochs=200, lr=0.0001),
                     node_mask_type='attributes',
                     edge_mask_type='object',
                     model_config=dict(
                         mode='multiclass_classification',
-                        task_level='node',
+                        task_level='edge',
                         return_type='raw'
-                    ),
+                    )
                 )
-
-                explanation = explainer(sub_features, map_edge_index, index=node_idx_mapped,
-                                        edge_weight=map_edge_weight)
-                edge_mask = explanation.edge_mask
+                explanation_old = explainer(
+                    x=sub_features,
+                    edge_index=map_edge_index_old,
+                    target=torch.tensor([predict_old_label]),
+                    edge_weight=map_edge_weight_old,
+                    pos_edge_index=pos_edge_index
+                )
+                edge_mask = explanation_old.edge_mask
 
             elif self.cfg.method == "pgexplainer":
-                from torch_geometric.explain import PGExplainer, Explainer
+                from baselines.torch_geometric.explain import PGExplainer, Explainer
 
-                train_epoch = 100
+                train_epoches = 100
                 train_lr = 0.001
 
-                explainer = Explainer(
-                    model=self.model_gnn,
-                    algorithm=PGExplainer(epochs=train_epoch, lr=train_lr),
+                explainer_old = Explainer(
+                    model=self.evaulate_model,
                     explanation_type='phenomenon',
+                    algorithm=PGExplainer(epochs=train_epoches, lr=train_lr),
                     edge_mask_type='object',
                     model_config=dict(
                         mode='multiclass_classification',
-                        task_level='node',
+                        task_level='graph',
                         return_type='raw'
-                    ),
+                    )
                 )
 
-                # PGExplainer 需要训练
-                # 获取子图对应的标签
-                sub_labels = self.labels[list(submapping.keys())]
-
-                for epoch in range(train_epoch):
-                    loss = explainer.algorithm.train(
-                        epoch, self.model_gnn, sub_features, map_edge_index,
-                        target=sub_labels, index=node_idx_mapped,
-                        edge_weight=map_edge_weight
-                    )
-
-                explanation = explainer(sub_features, map_edge_index, index=node_idx_mapped,
-                                        edge_weight=map_edge_weight, target=sub_labels)
-                edge_mask = explanation.edge_mask
+                for epoch in range(train_epoches):
+                    loss_old = explainer_old.algorithm.train(epoch, self.evaulate_model, sub_features, map_edge_index_old,
+                                                             target=torch.tensor([predict_old_label]),
+                                                             edge_weight=map_edge_weight_old,
+                                                             pos_edge_index=pos_edge_index)
+                explanation_old = explainer_old(sub_features, map_edge_index_old,
+                                                target=torch.tensor([predict_old_label]),
+                                                edge_weight=map_edge_weight_old, pos_edge_index=pos_edge_index)
+                edge_mask = explanation_old.edge_mask
 
 
 
@@ -1358,12 +1496,18 @@ class LinkExplainer:
 
 
             # 后处理（如果是 GNN-LRP 则进行 log 变换）
-            if self.cfg.method == "gnnlrp":
-                edge_mask = custom_log_transform(edge_mask)
 
-            # 保存
-            np.save(save_path, edge_mask.detach().cpu().numpy())
-            print(f"target edge {target_edge}: Computed and saved")
+
+
+            if self.cfg.method == "convex":
+                json_save_path = os.path.join(save_dir, f"{self.cfg.method}_{edge_str}.json")
+                with open(json_save_path, 'w') as f:
+                    json.dump(select_edges_list_value, f)
+                print(f"target edge {target_edge}: Computed and saved")
+            else:
+                np.save(cache_path, edge_mask.detach().cpu().numpy())
+                print(f"target edge {target_edge}: Computed and saved")
+
 
         return edge_mask
 
@@ -1392,7 +1536,7 @@ def parse_args() -> ExplainConfig:
     p.add_argument("--layer_numbers", type=int, default=2)
 
     # 解释方法
-    p.add_argument("--method", type=str, default="gnnlrp",
+    p.add_argument("--method", type=str, default="gnnexplainer",
                    choices=["deeplift", "flowx", "gnnexplainer", "gnnlrp", "pgexplainer", "convex"])
     p.add_argument("--sparsity", type=float, default=0.1)
 
@@ -1409,14 +1553,14 @@ def parse_args() -> ExplainConfig:
     p.add_argument("--max_train_edges", type=int, default=250)
 
     p.add_argument("--train_ratio", type=float, default=0.5)
-    p.add_argument("--percentage_threshold", type=float, default=0.8)
+    p.add_argument("--percentage_threshold", type=float, default=0.9)
 
     # 扰动
     p.add_argument("--num_remove_val_ratio", type=float, default=0.1)
     p.add_argument("--num_add_val_ratio", type=float, default=0.1)
 
     # 运行模式
-    p.add_argument("--run_mode", type=str, default="train",
+    p.add_argument("--run_mode", type=str, default="val",
                    choices=["train", "val", "select"])
     p.add_argument("--n_trials", type=int, default=50)
     p.add_argument("--lambda_min", type=float, default=0.0)
