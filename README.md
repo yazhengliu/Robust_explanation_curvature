@@ -24,19 +24,71 @@ python train_GCN.py --task graph_classification --dataset IMDB-BINARY
 
 Provides explanation for GNN model supporting multiple explanation methods and enhancing robustness of explanations through Ollivier-Ricci curvature and effective resistance.
 
-#### 1. TRAIN Mode - Filter Training Nodes
-```bash
-python explain.py --run_mode train --dataset Cora --method gnnlrp
-```
-The training nodes save to `train_node.json`
+We consider the following explanation methods: **DeepLIFT**, **FlowX**, **GNN-LRP**, **GNNExplainer**, **PGExplainer**, and **Convex**
 
-#### 2. VAL Mode - Filter Validation Nodes
+#### 1. TRAIN Mode - Filter training samples (nodes/edges/graphs) that are suitable for lambda optimization.
 ```bash
-python explain.py --run_mode val --dataset Cora --method gnnlrp
-```
-The validation nodes save to `val_node.json`
+# Node Classification
+python node_explain.py --dataset Cora --method deeplift --run_mode train
 
-#### 3. SELECT Mode - Optimize Lambda Parameter
+# Link Prediction
+python link_explain.py --dataset UCI --method deeplift --run_mode train
+
+# Graph Classification
+python graph_explain.py --dataset IMDB-BINARY --method deeplift --run_mode train
+```
+
+#### 2. SELECT Mode - Use Optuna to find optimal lambda values that improve explanation robustness when combined with graph curvature.
 ```bash
-python explain.py --run_mode select --dataset Cora --method gnnlrp --n_trials 50
+# Node Classification
+python node_explain.py --dataset Cora --method deeplift --run_mode select \
+--curvature_type ricci --lambda_min 0.0 --lambda_max 0.1 --n_trials 50
+
+# Link Prediction
+python link_explain.py --dataset UCI --method deeplift --run_mode select \
+    --curvature_type ricci --lambda_min 0.0 --lambda_max 0.1 --n_trials 50
+
+# Graph Classification
+python graph_explain.py --dataset IMDB-BINARY --method deeplift --run_mode select \
+    --curvature_type resistance --lambda_min 0.0 --lambda_max 0.1 --n_trials 50
+```
+
+#### 3. VAL Mode - Evaluate the curvature-enhanced explanations on validation samples using the optimized lambda values.
+```bash
+# Node Classification
+python node_explain.py --dataset Cora --method deeplift --run_mode val
+
+# Link Prediction
+python link_explain.py --dataset UCI --method deeplift --run_mode val
+
+# Graph Classification
+python graph_explain.py --dataset IMDB-BINARY --method deeplift --run_mode val
+```
+
+## Common Arguments
+
+| Argument | Description | Default |
+|----------|-------------|---------|
+| `--dataset` | Dataset name | Cora/Citeseer/Pheme/UCI/BC-OTC/BC-Alpha/MUTAG/IMDB-BINARY/PROTEINS |
+| `--method` | Explanation method | DeepLIFT/FlowX/GNN-LRP/GNNExplainer/PGExplainer/Convex |
+| `--run_mode` | Run mode (train/select/val) | select |
+| `--curvature_type` | Curvature type (ricci/resistance) | ricci |
+| `--sparsity` | Fraction of edges to select | 0.1 |
+| `--lambda_min` | Minimum lambda for optimization | 0.0 |
+| `--lambda_max` | Maximum lambda for optimization | 0.1 |
+| `--n_trials` | Number of Optuna trials | 50 |
+| `--num_remove_val_ratio` | Ratio of edges to remove in perturbation | 0.1 |
+| `--num_add_val_ratio` | Ratio of edges to add in perturbation | 0.1 |
+| `--normalize_adj` | Whether to normalize adjacency matrix | True/False |
+| `--seed` | Random seed | 42 |
+
+### Citation
+If you use this code in your research, please cite:
+```bash
+@article{liurobust,
+  title={Robust Explanations of Graph Neural Networks via Graph Curvatures},
+  author={Liu, Yazheng and Zhang, Xi and Xie, Sihong and Xiong, Hui},
+  conference={The Thirty-ninth Annual Conference on Neural Information Processing Systems}。
+  year={2025},
+}
 ```
