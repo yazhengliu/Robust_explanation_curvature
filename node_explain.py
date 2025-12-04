@@ -797,9 +797,9 @@ class NodeExplainer:
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl
                 result_important_dict[
-                    f'{idx_important},robustness {self.cfg.method} prob withoutcon'] = withoutcon_result_val_prob
+                    f'{idx_important},robustness {self.cfg.method} prob'] = withoutcon_result_val_prob
                 result_important_dict[
-                    f'{idx_important},robustness {self.cfg.method} kl withoutcon'] = withoutcon_result_val_kl
+                    f'{idx_important},robustness {self.cfg.method} kl'] = withoutcon_result_val_kl
 
                 # 评估基础选择
                 evaluate_edge_index_base, evaluate_edge_weight_base = from_edges_to_evaulate(
@@ -830,9 +830,9 @@ class NodeExplainer:
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob_base
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl_base
                 result_important_base_dict[
-                    f'{idx_important},robustness {self.cfg.method} prob withoutcon'] = withoutcon_result_val_prob
+                    f'{idx_important},robustness {self.cfg.method} prob'] = withoutcon_result_val_prob
                 result_important_base_dict[
-                    f'{idx_important},robustness {self.cfg.method} kl withoutcon'] = withoutcon_result_val_kl
+                    f'{idx_important},robustness {self.cfg.method} kl'] = withoutcon_result_val_kl
 
             # 保存结果
             if save_flag:
@@ -1159,6 +1159,7 @@ class NodeExplainer:
 
             if self.cfg.method == "deeplift":
                 # print('deeplift',deeplift)
+                from baselines.dig.xgraph.method import DeepLIFT
                 explainer = DeepLIFT(self.model_gnn, explain_graph=False)
                 sparsity = 1
                 _, masks, _ = explainer(sub_features, map_edge_index, sparsity=sparsity,
@@ -1167,6 +1168,7 @@ class NodeExplainer:
                 edge_mask = masks[predict_label]
 
             elif self.cfg.method == "flowx":
+                from baselines.dig.xgraph.method import FlowMask
                 explainer = FlowMask(self.model_gnn, explain_graph=False)
                 sparsity = 0
                 _, masks, _ = explainer(sub_features, map_edge_index, sparsity=sparsity,
@@ -1175,6 +1177,7 @@ class NodeExplainer:
                 edge_mask = masks[predict_label]
 
             elif self.cfg.method == "gnnlrp":
+                from baselines.dig.xgraph.method import gnn_lrp
                 explainer = GNN_LRP(self.model_gnn, explain_graph=False)
                 sparsity = 0
                 _, masks, _ = explainer(sub_features, map_edge_index, sparsity=sparsity,
@@ -1216,7 +1219,7 @@ class NodeExplainer:
                 edge_mask = torch.tensor(select_edges_list_value, dtype=torch.float32)
 
             elif self.cfg.method == "gnnexplainer":
-                from torch_geometric.explain import GNNExplainer, Explainer
+                from baselines.torch_geometric.explain import GNNExplainer, Explainer
 
                 explainer = Explainer(
                     model=self.model_gnn,
@@ -1236,7 +1239,7 @@ class NodeExplainer:
                 edge_mask = explanation.edge_mask
 
             elif self.cfg.method == "pgexplainer":
-                from torch_geometric.explain import PGExplainer, Explainer
+                from baselines.torch_geometric.explain import PGExplainer, Explainer
 
                 train_epoch = 100
                 train_lr = 0.001

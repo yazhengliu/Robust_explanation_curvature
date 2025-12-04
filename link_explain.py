@@ -885,9 +885,9 @@ class LinkExplainer:
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob
                 result_important_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl
                 result_important_dict[
-                    f'{idx_important},robustness {self.cfg.method} prob withoutcon'] = withoutcon_result_val_prob
+                    f'{idx_important},robustness {self.cfg.method} prob'] = withoutcon_result_val_prob
                 result_important_dict[
-                    f'{idx_important},robustness {self.cfg.method} kl withoutcon'] = withoutcon_result_val_kl
+                    f'{idx_important},robustness {self.cfg.method} kl'] = withoutcon_result_val_kl
 
                 # 评估基础选择
                 result_val_prob_base, result_val_kl_base = self.val_robustness_link(
@@ -902,24 +902,40 @@ class LinkExplainer:
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} prob'] = result_val_prob_base
                 result_important_base_dict[f'{idx_important},robustness {self.cfg.method} kl'] = result_val_kl_base
                 result_important_base_dict[
-                    f'{idx_important},robustness {self.cfg.method} prob withoutcon'] = withoutcon_result_val_prob
+                    f'{idx_important},robustness {self.cfg.method} prob'] = withoutcon_result_val_prob
                 result_important_base_dict[
-                    f'{idx_important},robustness {self.cfg.method} kl withoutcon'] = withoutcon_result_val_kl
+                    f'{idx_important},robustness {self.cfg.method} kl'] = withoutcon_result_val_kl
 
             # 保存结果
             if save_flag:
-                save_dir = self.get_lambda_save_dir()
-                lam_save_dir = os.path.join(save_dir, str(lam), self.cfg.curvature_type)
-                os.makedirs(lam_save_dir, exist_ok=True)
+                norm_dir = "normalize" if self.cfg.normalize_adj else "no_normalize"
+
+                # 保存曲率增强结果
+                curv_save_dir = os.path.join(
+                    self.cfg.result_root, norm_dir, self.cfg.curvature_type,
+                    self.modelname, self.cfg.method,
+                    f"{self.cfg.num_add_val_ratio}_{self.cfg.num_remove_val_ratio}",
+                    str(lam), self.cfg.curvature_type
+                )
+                os.makedirs(curv_save_dir, exist_ok=True)
 
                 edge_str = f"{target_edge[0]}_{target_edge[1]}"
-                with open(os.path.join(lam_save_dir, f"{edge_str}.json"), 'w') as f:
+                with open(os.path.join(curv_save_dir, f"{edge_str}.json"), 'w') as f:
                     json.dump(result_important_dict, f)
-                with open(os.path.join(lam_save_dir, f"{edge_str}_base.json"), 'w') as f:
+
+                # 保存基础结果
+                base_save_dir = os.path.join(
+                    self.cfg.result_root, norm_dir, self.cfg.curvature_type,
+                    self.modelname, self.cfg.method,
+                    f"{self.cfg.num_add_val_ratio}_{self.cfg.num_remove_val_ratio}",
+                    str(lam), "base"
+                )
+                os.makedirs(base_save_dir, exist_ok=True)
+
+                with open(os.path.join(base_save_dir, f"{edge_str}.json"), 'w') as f:
                     json.dump(result_important_base_dict, f)
 
                 print(f"Edge {target_edge}: Saved results for lambda={lam}")
-
 
     def run(self):
         """根据配置的模式运行"""
@@ -1536,7 +1552,7 @@ def parse_args() -> ExplainConfig:
     p.add_argument("--layer_numbers", type=int, default=2)
 
     # 解释方法
-    p.add_argument("--method", type=str, default="gnnexplainer",
+    p.add_argument("--method", type=str, default="convex",
                    choices=["deeplift", "flowx", "gnnexplainer", "gnnlrp", "pgexplainer", "convex"])
     p.add_argument("--sparsity", type=float, default=0.1)
 
